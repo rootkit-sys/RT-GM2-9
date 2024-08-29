@@ -1,6 +1,5 @@
 from requests import get, post, Session
 from Crypto.Cipher import AES
-from sys import argv, exit
 from Crypto import Random
 from random import random
 from hashlib import md5
@@ -9,112 +8,115 @@ import argparse
 import socket
 import gzip
 
-parser = argparse.ArgumentParser(description="RT-GM2-9/1.6.1379 enable SSH")
-	
-parser.add_argument("-L", "--login", type=str, required=True, help="login")
-parser.add_argument("-P", "--password", type=str, required=True, help="password")
+parser = argparse.ArgumentParser(description="RT-GM2-9/1.6.1379 superadmin password extraction")
+
+parser.add_argument("-H", "--host", type=str, default="192.168.0.1", help="router IP address, ex: '192.168.0.1' and '192.168.0.1:9090' if default HTTP port has been changed")
+parser.add_argument("-L", "--login", type=str, required=True, help="admin login")
+parser.add_argument("-P", "--password", type=str, required=True, help="admin password")
+parser.add_argument("-M", "--mod", type=str, default = "RT-GM2-9", help="router model, ex: 'RT-GM2-9'")
+parser.add_argument("-S", "--ssh", action="store_true", help="enable SSH")
+parser.add_argument("-T", "--tr", action="store_true", help="disable TR-069, only possible if SSH is enabled")
 	
 args = parser.parse_args()
 
-login, password = args.login, args.password
-host, port = "192.168.0.1", 80
+print("\n\t[+] Host: %s, mod: %s\n\t[+] Login: %s\n\t[+] Password: %s\n\t[+] Enable SSH: %s\n\t[+] Disable TR-069: %s\n" % (args.host, args.mod, args.login, args.password, args.ssh, args.tr))
 
-print("[+] Host:%s\n[+] Port:%i\n[+] Login:%s\n[+] Password:%s" % (host, port, login, password))
+url = "http://" + args.host
 
-pass_hash = md5(password.encode()).hexdigest()
+def get_session(login, password):
+	
+	sesh = Session()
+	req = sesh.post(url + "/login.htm", data={"f_password":md5(password.encode()).hexdigest(), "f_currURL":url+"/old_login.htm", "f_username":login, "pwd":""})
+	return sesh
 
-sesh = Session()
+def get_session_key(sesh):
 
-print("[+] Getting old config...")
+	return sesh.get(url + "/advanced/conSession.htm", params={"id":str(random())}).text
 
-req = sesh.post("http://%s:%i/login.htm" % (host, port), data={"f_password":pass_hash, "f_currURL":"http://%s:%i/old_login.htm" % (host, port), "f_username":login, "pwd":""})
-session_key = sesh.get("http://%s:%i/advanced/conSession.htm" % (host, port), params={"id":str(random())}).text
-req = get("http://%s:%i/config_old_tl.xgi" % (host, port), params = {"sessionKey":session_key})
+def logout(sesh):
 
-file = open("config.bin", "wb")
-file.write(req.content)
-file.close()
+	sesh.get(url + "/maintenance/logout.xgi", params = {"sessionKey":get_session_key(sesh)})
+	sesh.get(url + "/login.htm", params = {"logtmr":0})
 
-print("[+] decryption...")
-#DECRIPTION
+def save_old_config(sesh):
 
-enc_file = open("config.bin", "rb")
-out_file = open("config.gz", "wb")
+	config = sesh.get(url + "/config_old_tl.xgi", params = {"sessionKey":get_session_key(sesh)}).content
+	file = open("config.bin", "wb")
+	file.write(config)
+	file.close()
 
-enc_file.read(16)
+def decrypt_config(mod):
 
-bs = AES.block_size
-salt = enc_file.read(bs)[len("Salted__"):]
-d = d_i = b""
-password = b"RT-GM2-9"
+	enc_file = open("config.bin", "rb")
+	enc_file.read(16)
 
-key_length = 32
-iv_length = bs
+	out_file = open("config.gz", "wb")
 
-while len(d) < key_length + iv_length:
+	bs = AES.block_size
+	salt = enc_file.read(bs)[len("Salted__"):]
+	d = d_i = b""
+	key_length = 32
+	iv_length = bs
 
-	d_i = md5(d_i + password + salt).digest()
-	d += d_i
+	while len(d) < key_length + iv_length:
 
-key = d[:key_length] 
-iv = d[key_length:key_length+iv_length]
-cipher = AES.new(key, AES.MODE_CBC, iv)
-next_chunk = b""
-finished = False
+		d_i = md5(d_i + mod.encode() + salt).digest()
+		d += d_i
 
-while not finished:
+	key = d[:key_length] 
+	iv = d[key_length:key_length+iv_length]
+	cipher = AES.new(key, AES.MODE_CBC, iv)
+	next_chunk = b""
+	finished = False
 
-	chunk, next_chunk = next_chunk, cipher.decrypt(enc_file.read(1024 * bs))
+	while not finished:
 
-	if len(next_chunk) == 0:
+		chunk, next_chunk = next_chunk, cipher.decrypt(enc_file.read(1024 * bs))
 
-		padding_length = chunk[-1]
-		chunk = chunk[:-padding_length]
-		finished = True
+		if len(next_chunk) == 0:
+			padding_length = chunk[-1]
+			chunk = chunk[:-padding_length]
+			finished = True
 
-	out_file.write(chunk)
+		out_file.write(chunk)
 
-enc_file.close()
-out_file.close()
+	enc_file.close()
+	remove("config.bin")
+	out_file.close()
 
-#SUPERADMIN PASS
+	config_gz = gzip.open("config.gz", "rb")
 
-config_gz = gzip.open("config.gz", "rb")
+	while 1:
 
-while 1:
+		line = config_gz.readline()
+		
+		if b"superadmin" in line:
+			pass_line = config_gz.readline()
+			break
 
-	line = config_gz.readline()
-	if b"superadmin" in line:
-		pass_line = config_gz.readline()
-		config_gz.close()
-		break
+	password = pass_line.decode().strip().strip("<password>").strip("</")
 
-remove("config.bin")
-remove("config.gz")
+	config_gz.close()
+	remove("config.gz")
+	open("superadmin.txt", "w").write("superadmin:" + password)
+	
+	return "superadmin", password
 
-login = "superadmin"
-password = pass_line.decode().strip().strip("<password>").strip("</")
-pass_hash = md5(password.encode()).hexdigest()
+def disable_tr(login, password):
 
-open("superadmin.txt", "w").write("superadmin:" + password)
+	from paramiko import AutoAddPolicy, SSHClient
 
-print("[+] superadmin pass: %s" % (password))
+	cli = SSHClient()
+	cli.set_missing_host_key_policy(AutoAddPolicy())
+	cli.connect(hostname=args.host, username=login, password=password)
 
-#LOGOUT
+	cli.exec_command("csmconf -s /InternetGatewayDevice/ManagementServer/EnableCWMP 0")
+	cli.exec_command("csmctl savecfg")
 
-session_key = sesh.get("http://%s:%i/advanced/conSession.htm" % (host, port), params={"id":str(random())}).text
-req = sesh.get("http://%s:%i/maintenance/logout.xgi" % (host, port), params = {"sessionKey":session_key})
-req = sesh.get("http://%s:%i/login.htm" % (host, port), params = {"logtmr":0})
+def enable_ssh(sesh):
 
-#ENABLE SSH
-
-sesh = Session()
-
-req = sesh.post("http://%s:%i/login.htm" % (host, port), data={"f_password":pass_hash, "f_currURL":"http://%s:%i/old_login.htm" % (host, port), "f_username":login, "pwd":""})
-session_key = sesh.get("http://%s:%i/advanced/conSession.htm" % (host, port), params={"id":str(random())}).text
-
-data = {
-	"sessionKey":session_key,
+	data = {
+	"sessionKey":get_session_key(sesh),
 	"setPath":"/InternetGatewayDevice/UserInterface/RemoteAccess:6/",
 	"IP": "0.0.0.0",
 	"Mask": "0.0.0.0",
@@ -127,12 +129,30 @@ data = {
 	"APPLY": 1
 		}
 
-req = sesh.get("http://%s:%i/maintenance/mt_acremote_tl.xgi" % (host, port), params = data)
+	sesh.get(url + "/maintenance/mt_acremote_tl.xgi", params = data)
 
-sock = socket.socket()
-sock.settimeout(10)
-try:
-	sock.connect((host, 22))
-	print("[+] %s:%i --> %s" % (host, 22, sock.recv(1024).decode()))
-except Exception as error:
-	print(error)
+	sock = socket.socket()
+	sock.settimeout(10)
+	try:
+		sock.connect((args.host, 22))
+		print("\n\t[+] %s:22 --> %s" % (args.host, sock.recv(1024).decode()))
+		sock.close()
+	except Exception as error:
+		print(error)
+
+print("[+] extracting superadmin password...")
+sesh = get_session(args.login, args.password)
+save_old_config(sesh)
+login, password = decrypt_config(args.mod)
+
+print("[+] superadmin password: %s" % password)
+
+logout(sesh)
+sesh = get_session(login, password)
+
+if args.ssh:
+	print("[+] enable SSH")
+	enable_ssh(sesh)
+if args.tr:
+	print("[+] disable TR-069")
+	disable_tr(login, password)
